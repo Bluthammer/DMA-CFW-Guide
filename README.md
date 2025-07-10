@@ -252,16 +252,158 @@ On default pcileech firmware you can locate: **PM at 0x40, MSI at 0x50, and PCIe
 
   
 ## **6. TLP Emulation**
-**For now, see:**
+
+> [!NOTE]
+> Research into this topic is ongoing.
+
+For now you have only changed the static device properties. They however do not communicate with the actual device driver as you can see from the yellow warning sign in your windows device manager. To mimic an actual device you have to emulate the values stored in the memory regions defined by the BARs of the original device.
+
+You can just copy the memory values and the corresponding addresses in a useful verilog format using this small C program:
+
+```
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <ctype.h>
+#include <termios.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+
+uint8_t main(int argc, char **argv)
+{
+    uint32_t sys_handle = open(argv[1], O_RDWR | O_SYNC);
+    printf("Opening File : %s\n", argv[1]);
+    uint8_t type_width = sizeof(uint32_t);
+    if (sys_handle == -1)
+    {
+        printf("Failed to open with error : %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
+    off_t target = 0;
+    off_t target_base = target & ~(sysconf(_SC_PAGE_SIZE) - 1);
+    uint32_t map_size = 4096UL;
+    void *map_base = mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, sys_handle, target_base);
+    printf("PCI Memory mapped to: 0x%08lx.\n", (unsigned long) map_base);
+    for (uint16_t i = 0; i < 0x1000 / type_width + 1; i += 1)
+    {
+        uint32_t read_result = *((uint32_t *)(map_base + i * type_width + target - target_base));
+        printf("16'h%04X : rd_rsp_data <= 32'h%08X;\n", (uint32_t)(i * type_width + target), read_result);
+    }
+    return EXIT_SUCCESS;
+}
+```
+> [!IMPORTANT]
+> Make sure to run & compile this program on linux and **disable** secure boot in your BIOS. Otherwise you will not be able to read `resource0`.
+
+Just compile the program with `gcc bar.c -o bar` and run it with `./bar /sys/bus/pci/devices/0000:xx:xx.x/resource0`. Replace `0000:xx:xx.x` with the path of your original PCIe device.
+
+The output should look like this:
+
+```
+$ sudo ./bar /sys/bus/pci/devices/0000:03:00.0/resource0
+Opening File : /sys/bus/pci/devices/0000:03:00.0/resource0
+PCI Memory mapped to: 0x7f86b120c000.
+16'h0000 : rd_rsp_data <= 32'h01110010;
+16'h0004 : rd_rsp_data <= 32'h00000000;
+16'h0008 : rd_rsp_data <= 32'h00A1088F;
+16'h000C : rd_rsp_data <= 32'h0000003F;
+16'h0010 : rd_rsp_data <= 32'h0000003F;
+16'h0014 : rd_rsp_data <= 32'h80000000;
+16'h0018 : rd_rsp_data <= 32'h04048278;
+16'h001C : rd_rsp_data <= 32'h31233434;
+16'h0020 : rd_rsp_data <= 32'hF000B222;
+16'h0024 : rd_rsp_data <= 32'h00110696;
+16'h0028 : rd_rsp_data <= 32'h00000001;
+16'h002C : rd_rsp_data <= 32'h00000000;
+
+... more 
+
+16'h0FF4 : rd_rsp_data <= 32'hFFFFFFFF;
+16'h0FF8 : rd_rsp_data <= 32'hFFFFFFFF;
+16'h0FFC : rd_rsp_data <= 32'hFFFFFFFF;
+16'h1000 : rd_rsp_data <= 32'h00000000;
+```
+
+Now you just have to modify the BAR controller in `pcileech_tlps128_bar_controller.sv` by mainly adding `input  [31:0]       base_address_register` and a `case` statement that fixes the MSB / LSB order of each 8-bit block in the 32-bit address and returns the memory values, when the corresponding address is called.
+
+```
+module pcileech_bar_impl_zerowrite4k(
+    input               rst,
+    input               clk,
+    input [31:0]        wr_addr,
+    input [3:0]         wr_be,
+    input [31:0]        wr_data,
+    input               wr_valid,
+    input  [87:0]       rd_req_ctx,
+    input  [31:0]       rd_req_addr,
+    input               rd_req_valid,
+    input  [31:0]       base_address_register,
+    output bit [87:0]   rd_rsp_ctx,
+    output bit [31:0]   rd_rsp_data,
+    output bit          rd_rsp_valid
+);
+    bit [87:0]      drd_req_ctx;
+    bit [31:0]      drd_req_addr;
+    bit             drd_req_valid;
+    bit [31:0]      dwr_addr;
+    bit [31:0]      dwr_data;
+    bit             dwr_valid;
+    bit [31:0]      data_32;
+    time number = 0;
+    
+    always @ ( posedge clk ) begin
+        if (rst)
+            number <= 0;
+
+        number          <= number + 1;
+        drd_req_ctx     <= rd_req_ctx;
+        drd_req_valid   <= rd_req_valid;
+        dwr_valid       <= wr_valid;
+        drd_req_addr    <= rd_req_addr;
+        rd_rsp_ctx      <= drd_req_ctx;
+        rd_rsp_valid    <= drd_req_valid;
+        dwr_addr        <= wr_addr;
+        dwr_data        <= wr_data;
+    
+        if (drd_req_valid) begin
+            case (({drd_req_addr[31:24], drd_req_addr[23:16], drd_req_addr[15:08], drd_req_addr[07:00]} - (base_address_register & ~32'h4)) & 32'hFFFF)
+
+              //The code block you received from the C code
+              16'h0000 : rd_rsp_data <= 32'h01110010;
+              16'h0004 : rd_rsp_data <= 32'h00000000;
+              16'h0008 : rd_rsp_data <= 32'h00A1088F;
+              16'h000C : rd_rsp_data <= 32'h0000003F;
+              16'h0010 : rd_rsp_data <= 32'h0000003F;
+              16'h0014 : rd_rsp_data <= 32'h80000000;
+              16'h0018 : rd_rsp_data <= 32'h04048278;
+              16'h001C : rd_rsp_data <= 32'h31233434;
+              16'h0020 : rd_rsp_data <= 32'hF000B222;
+              16'h0024 : rd_rsp_data <= 32'h00110696;
+              16'h0028 : rd_rsp_data <= 32'h00000001;
+              16'h002C : rd_rsp_data <= 32'h00000000;
+
+              ... more 
+
+              16'h0FF4 : rd_rsp_data <= 32'hFFFFFFFF;
+              16'h0FF8 : rd_rsp_data <= 32'hFFFFFFFF;
+              16'h0FFC : rd_rsp_data <= 32'hFFFFFFFF;
+              16'h1000 : rd_rsp_data <= 32'h00000000;
+
+            default : rd_rsp_data <= 32'h00000000;
+            endcase
+        end
+    end
+endmodule
+```
+
+**Also see:**
 1. [Ekknod's bar controller config](https://github.com/ekknod/pcileech-wifi/blob/main/src/pcileech_tlps128_bar_controller.sv#L850) between line 850-896 for an example
 2. [One of Yxlnq's bar controllers](https://github.com/yxlnqs/diviner-full-emu-v2/blob/5a177e34ae5dae94bb2c023e38301af425ca6e4b/src/pcileech_tlps128_bar_controller.sv#L850)
-
-Notes to consider:
- 
-
-1. You have two options for obtaining the register addresses for the device you're emulating, your options are:
-- Searching to see if your driver is already open source and looking through it, a good starting point is this [Wikipedia](https://en.wikipedia.org/wiki/Comparison_of_open-source_wireless_drivers) page that lists open-source/reverse-engineered wireless drivers that you could take values from for your firmware
-- **[Hard]** Using a reverse-engineering program of your choice to find the details of your driver for your donor card, you can find the location of the installed driver by navigating to your device in the device manager, going to Properties>Driver>Driver Details, and it should normally be the only .dll file in there. (Mind you unless you are already well versed in the area of reverse engineering, don't commit your time to this)
 
 ### Resources for general understanding & TLP emulation
 1. https://fpgaemu.readthedocs.io/en/latest/emulation.html
